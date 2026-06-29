@@ -3,13 +3,20 @@
 Browns Mill Golf Course - Fore Pass Tee Time Booker
 Automates browsing, login, and checkout via Playwright.
 Stops at "Complete your purchase" by default (human-in-the-loop safety).
+
+Usage:
+    python book_tee_time.py
+    python book_tee_time.py --date 2026-07-12
+    python book_tee_time.py --auto-complete  # dangerous: clicks "Complete your purchase"
 """
 
 import os
 import sys
+import re
 import logging
+import argparse
 import datetime
-from typing import Optional
+from typing import Optional, List
 from dotenv import load_dotenv
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
 
@@ -29,6 +36,7 @@ AUTO_COMPLETE_PURCHASE = os.getenv("AUTO_COMPLETE_PURCHASE", "false").lower() ==
 WEBHOOK_URL = os.getenv("WEBHOOK_URL", "")
 
 BASE_URL = "https://www.cityofatlantagolf.com/browns-mill-fore-pass-member-tee-times/"
+RESERVATIONS_URL = "https://browns-mill-fore-passholder.book.teeitup.golf/reservation/history"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -38,29 +46,124 @@ logging.basicConfig(
 logger = logging.getLogger("golf-booker")
 
 
-def get_next_target_date(target_weekday: int = TARGET_DAY_OF_WEEK) -> datetime.date:
-    """Return the next occurrence of the target weekday (0=Mon, 6=Sun)."""
-    today = datetime.date.today()
-    days_ahead = target_weekday - today.weekday()
+# ---------------------------------------------------------------------------
+# Date Logic
+# ---------------------------------------------------------------------------
+def get_next_weekday(target_weekday: int, after_date: Optional[datetime.date] = None) -> datetime.date:
+    """Return the next occurrence of target_weekday on or after after_date."""
+    if after_date is None:
+        after_date = datetime.date.today()
+    days_ahead = target_weekday - after_date.weekday()
     if days_ahead <= 0:
         days_ahead += 7
-    return today + datetime.timedelta(days=days_ahead)
+    return after_date + datetime.timedelta(days=days_ahead)
 
 
+def parse_existing_reservation_dates(iframe) -> List[datetime.date]:
+    """
+    Navigate to the Reservations page and parse dates of existing bookings.
+    Returns a list of datetime.date objects.
+    """
+    logger.info("Checking existing reservations...")
+    dates: List[datetime.date] = []
+
+    try:
+        # Click the Reservations tab/link
+        reservations_link = iframe.locator("a[href='/reservation/history'], text=Reservations").first
+        if reservations_link.is_visible(timeout=5000):
+            reservations_link.click()
+            iframe.page.wait_for_timeout(2000)
+        else:
+            # Navigate directly inside the iframe
+            iframe.page.goto(RESERVATIONS_URL, wait_until="networkidle", timeout=15000)
+            iframe.page.wait_for_timeout(2000)
+
+        # Look for date patterns in the reservation list
+        # Common formats: "07/05/2026", "July 5, 2026", "Jul 05, 2026"
+        page_text = iframe.page.content()
+
+        # Pattern 1: MM/DD/YYYY
+        for m in re.finditer(r'(\d{1,2})/(\d{1,2})/(\d{4})', page_text):
+            try:
+                d = datetime.date(int(m.group(3)), int(m.group(1)), int(m.group(2)))
+                dates.append(d)
+            except ValueError:
+                continue
+
+        # Pattern 2: Month DD, YYYY (e.g. "July 5, 2026")
+        month_map = {
+            'january': 1, 'february': 2, 'march': 3, 'april': 4,
+            'may': 5, 'june': 6, 'july': 7, 'august': 8,
+            'september': 9, 'october': 10, 'november': 11, 'december': 12
+        }
+        for m in re.finditer(r'([A-Za-z]+)\s+(\d{1,2}),?\s+(\d{4})', page_text):
+            month_name = m.group(1).lower()
+            if month_name in month_map:
+                try:
+                    d = datetime.date(int(m.group(3)), month_map[month_name], int(m.group(2)))
+                    dates.append(d)
+                except ValueError:
+                    continue
+
+        # Remove duplicates and sort
+        dates = sorted(list(set(dates)))
+        logger.info(f"Found {len(dates)} existing reservation date(s): {[d.isoformat() for d in dates]}")
+
+    except Exception as e:
+        logger.warning(f"Could not read reservations: {e}")
+
+    return dates
+
+
+def determine_target_date(
+    existing_dates: List[datetime.date],
+    target_weekday: int = TARGET_DAY_OF_WEEK,
+    min_days_ahead: int = 2,
+) -> datetime.date:
+    """
+    Determine the best target date to book.
+
+    Logic:
+      1. If there are existing reservations on the target weekday,
+         find the latest one and target the NEXT occurrence.
+      2. Otherwise, target the next upcoming target weekday
+         that is at least min_days_ahead from today.
+    """
+    today = datetime.date.today()
+    weekday_dates = [d for d in existing_dates if d.weekday() == target_weekday]
+
+    if weekday_dates:
+        latest = max(weekday_dates)
+        logger.info(f"Latest booked {latest.strftime('%A')}: {latest}")
+        # Book the next one after the latest reservation
+        candidate = get_next_weekday(target_weekday, after_date=latest + datetime.timedelta(days=1))
+    else:
+        logger.info("No existing reservations found on target weekday.")
+        candidate = get_next_weekday(target_weekday)
+
+    # Ensure we don't book too close to today (tee times may not be released yet)
+    min_date = today + datetime.timedelta(days=min_days_ahead)
+    while candidate < min_date:
+        logger.info(f"Candidate {candidate} is too close to today. Looking further ahead...")
+        candidate = get_next_weekday(target_weekday, after_date=candidate + datetime.timedelta(days=1))
+
+    logger.info(f"Determined target date: {candidate} ({candidate.strftime('%A')})")
+    return candidate
+
+
+# ---------------------------------------------------------------------------
+# Notifications
+# ---------------------------------------------------------------------------
 def send_notification(message: str) -> None:
-    """Optional webhook notification."""
     if not WEBHOOK_URL:
         return
     try:
         import urllib.request
         import json
-
         data = json.dumps({"text": message}).encode("utf-8")
         req = urllib.request.Request(
-            WEBHOOK_URL,
-            data=data,
-            headers={"Content-Type": "application/json"},
-            method="POST",
+            WEBHOOK_URL, data=data,
+            headers={"Content-Type": "application/json"}, method="POST",
         )
         urllib.request.urlopen(req, timeout=10)
         logger.info("Notification sent.")
@@ -68,21 +171,19 @@ def send_notification(message: str) -> None:
         logger.warning(f"Failed to send notification: {e}")
 
 
+# ---------------------------------------------------------------------------
+# Browser Automation
+# ---------------------------------------------------------------------------
 def get_teeitup_frame(page):
-    """Return the TeeItUp iframe locator, waiting until it exists."""
     logger.info("Locating TeeItUp iframe...")
-    # Wait for the iframe to attach
     page.wait_for_selector("iframe", timeout=15000)
-    # TeeItUp iframe src contains teeitup.golf
     iframe = page.frame_locator("iframe[src*='teeitup.golf']").first
     return iframe
 
 
 def enter_wordpress_password(page) -> None:
-    """Handle the WordPress password-protected page."""
     logger.info("Checking for WordPress password page...")
     try:
-        # The password form may or may not appear depending on session
         password_input = page.locator("input[type='password']").first
         if password_input.is_visible(timeout=3000):
             logger.info("Entering WordPress password...")
@@ -91,16 +192,14 @@ def enter_wordpress_password(page) -> None:
             page.wait_for_load_state("networkidle")
             logger.info("WordPress password submitted.")
         else:
-            logger.info("No WordPress password prompt (already unlocked or cookie present).")
+            logger.info("No WordPress password prompt.")
     except PlaywrightTimeout:
         logger.info("No WordPress password prompt detected.")
 
 
 def login_teeitup(iframe) -> None:
-    """Log into TeeItUp inside the iframe."""
     logger.info("Checking TeeItUp login state...")
     try:
-        # If already logged in, we see the user menu button
         user_menu = iframe.locator("[data-testid='core-user-menu']").first
         if user_menu.is_visible(timeout=3000):
             logger.info("Already logged in to TeeItUp.")
@@ -109,63 +208,44 @@ def login_teeitup(iframe) -> None:
         pass
 
     logger.info("Opening TeeItUp login form...")
-    login_btn = iframe.locator("[data-testid='core-login-signup']").first
-    login_btn.click()
-
+    iframe.locator("[data-testid='core-login-signup']").first.click()
     logger.info("Filling TeeItUp credentials...")
     iframe.locator("[data-testid='login-email-component']").fill(TEEITUP_USERNAME)
     iframe.locator("[data-testid='login-password-component']").fill(TEEITUP_PASSWORD)
     iframe.locator("[data-testid='login-button']").click()
-
-    # Wait for login to complete (user menu appears or tee times load)
     iframe.locator("[data-testid='core-user-menu']").first.wait_for(state="visible", timeout=15000)
     logger.info("TeeItUp login successful.")
 
 
 def navigate_to_date(iframe, target_date: datetime.date) -> None:
-    """Use the calendar to navigate to the target date."""
     logger.info(f"Navigating calendar to {target_date}...")
+    target_month_year = target_date.strftime("%B %Y")
 
-    # The calendar shows a month; we need to click "Next month" until we reach target month/year
-    target_month_year = target_date.strftime("%B %Y")  # e.g. "July 2026"
-
-    max_clicks = 12
-    for _ in range(max_clicks):
-        # Read current month label
+    for _ in range(12):
         month_label = iframe.locator("[data-testid='teetimes-calendar-component'] p").first
         current_text = month_label.inner_text(timeout=5000).strip()
         if target_month_year.lower() in current_text.lower():
             break
         next_month_btn = iframe.locator("button[aria-label*='Next month'], button:has-text('Next month')").first
         next_month_btn.click()
-        # Wait for calendar animation
         iframe.page.wait_for_timeout(500)
     else:
         raise RuntimeError(f"Could not navigate to {target_month_year}")
 
-    # Click the specific date
     day_str = str(target_date.day)
     logger.info(f"Selecting day {day_str}...")
     date_cell = iframe.locator(f"[role='gridcell']:has-text('{day_str}')").first
-    # Ensure it's not disabled
     if date_cell.get_attribute("disabled"):
         raise RuntimeError(f"Date {target_date} is disabled/unavailable.")
     date_cell.click()
-    iframe.page.wait_for_timeout(2000)  # Let tee times load
+    iframe.page.wait_for_timeout(2000)
     logger.info("Date selected, tee times loading...")
 
 
 def select_tee_time(iframe) -> bool:
-    """
-    Select the best tee time within the configured hour window.
-    Returns True if a tee time was selected.
-    """
     logger.info(f"Looking for tee times between {TARGET_HOUR_START}:00 and {TARGET_HOUR_END}:00...")
-
-    # Wait for tee time list to appear
     iframe.locator("[data-testid='teetimes_choose_rate_button']").first.wait_for(state="visible", timeout=15000)
 
-    # Get all tee time cards
     choose_buttons = iframe.locator("button:has-text('Choose Rate')").all()
     logger.info(f"Found {len(choose_buttons)} tee time option(s).")
 
@@ -174,8 +254,6 @@ def select_tee_time(iframe) -> bool:
 
     for btn in choose_buttons:
         aria = btn.get_attribute("aria-label") or ""
-        # Parse time from aria-label, e.g. "July 5th 2026, 8:50:00 am"
-        # We'll do a simple extraction
         time_part = None
         if "," in aria:
             time_part = aria.split(",")[-1].strip().lower()
@@ -183,16 +261,13 @@ def select_tee_time(iframe) -> bool:
         if not time_part:
             continue
 
-        # Extract hour
         hour = None
         if "am" in time_part or "pm" in time_part:
-            # Remove am/pm and parse
             time_clean = time_part.replace("am", "").replace("pm", "").strip()
             parts = time_clean.split(":")
             if len(parts) >= 2:
                 try:
                     h = int(parts[0])
-                    m = int(parts[1])
                     if "pm" in time_part and h != 12:
                         h += 12
                     if "am" in time_part and h == 12:
@@ -220,7 +295,6 @@ def select_tee_time(iframe) -> bool:
 
 
 def add_to_cart(iframe) -> None:
-    """Add the selected tee time to cart."""
     logger.info("Adding to cart...")
     add_btn = iframe.locator("[data-testid='add-to-cart-button']").first
     add_btn.wait_for(state="visible", timeout=10000)
@@ -230,10 +304,8 @@ def add_to_cart(iframe) -> None:
 
 
 def proceed_to_checkout(iframe) -> None:
-    """Open cart and click checkout."""
     logger.info("Opening cart...")
-    cart_btn = iframe.locator("[data-testid='shopping-cart-button']").first
-    cart_btn.click()
+    iframe.locator("[data-testid='shopping-cart-button']").first.click()
     iframe.page.wait_for_timeout(1500)
 
     logger.info("Clicking checkout...")
@@ -244,11 +316,8 @@ def proceed_to_checkout(iframe) -> None:
     logger.info("At checkout page.")
 
 
-def handle_checkout(iframe) -> None:
-    """Agree to terms and stop (or complete purchase)."""
+def handle_checkout(iframe, auto_complete: bool = False) -> None:
     logger.info("Handling checkout...")
-
-    # Check terms box
     terms = iframe.locator("[data-testid='terms-and-conditions-checkbox']").first
     terms.wait_for(state="visible", timeout=10000)
     terms.click()
@@ -257,7 +326,7 @@ def handle_checkout(iframe) -> None:
     complete_btn = iframe.locator("button:has-text('Complete your purchase')").first
     complete_btn.wait_for(state="visible", timeout=10000)
 
-    if AUTO_COMPLETE_PURCHASE:
+    if auto_complete:
         logger.warning("AUTO_COMPLETE_PURCHASE is enabled. Finalizing purchase!")
         complete_btn.click()
         iframe.page.wait_for_timeout(3000)
@@ -273,17 +342,16 @@ def handle_checkout(iframe) -> None:
 
 
 def take_screenshot(page, name: str) -> None:
-    """Save a screenshot for debugging."""
     os.makedirs("screenshots", exist_ok=True)
     path = f"screenshots/{name}.png"
     page.screenshot(path=path, full_page=True)
     logger.info(f"Screenshot saved: {path}")
 
 
-def run() -> None:
-    target_date = get_next_target_date()
-    logger.info(f"Target date: {target_date} ({target_date.strftime('%A')})")
-
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+def run(target_date: Optional[datetime.date] = None, auto_complete: bool = False) -> None:
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         context = browser.new_context(
@@ -308,6 +376,16 @@ def run() -> None:
             login_teeitup(iframe)
             take_screenshot(page, "03_after_login")
 
+            # If no explicit date provided, check reservations and determine dynamically
+            if target_date is None:
+                existing_dates = parse_existing_reservation_dates(iframe)
+                target_date = determine_target_date(existing_dates)
+                # Navigate back to tee times page if we went to reservations
+                page.goto(BASE_URL, wait_until="networkidle", timeout=30000)
+                iframe = get_teeitup_frame(page)
+
+            logger.info(f"Target date: {target_date} ({target_date.strftime('%A')})")
+
             navigate_to_date(iframe, target_date)
             take_screenshot(page, "04_after_date_select")
 
@@ -325,7 +403,7 @@ def run() -> None:
             proceed_to_checkout(iframe)
             take_screenshot(page, "07_at_checkout")
 
-            handle_checkout(iframe)
+            handle_checkout(iframe, auto_complete=auto_complete)
             take_screenshot(page, "08_final_state")
 
             logger.info("Script finished successfully.")
@@ -340,5 +418,43 @@ def run() -> None:
             browser.close()
 
 
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Browns Mill Golf Tee Time Booker")
+    parser.add_argument(
+        "--date",
+        type=str,
+        help="Explicit date to book (YYYY-MM-DD). Overrides dynamic date logic.",
+    )
+    parser.add_argument(
+        "--auto-complete",
+        action="store_true",
+        help="Click 'Complete your purchase' automatically (DANGEROUS).",
+    )
+    parser.add_argument(
+        "--target-weekday",
+        type=int,
+        default=TARGET_DAY_OF_WEEK,
+        help="Day of week to target: 0=Mon, 6=Sun (default: 6)",
+    )
+    args = parser.parse_args()
+
+    explicit_date = None
+    if args.date:
+        try:
+            explicit_date = datetime.date.fromisoformat(args.date)
+        except ValueError:
+            logger.error(f"Invalid date format: {args.date}. Use YYYY-MM-DD.")
+            sys.exit(1)
+
+    auto_complete = args.auto_complete or AUTO_COMPLETE_PURCHASE
+    if auto_complete:
+        logger.warning("=" * 60)
+        logger.warning("AUTO-COMPLETE IS ENABLED!")
+        logger.warning("This will finalize the purchase without human review.")
+        logger.warning("=" * 60)
+
+    run(target_date=explicit_date, auto_complete=auto_complete)
+
+
 if __name__ == "__main__":
-    run()
+    main()

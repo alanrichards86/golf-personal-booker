@@ -5,6 +5,16 @@ on:
     # Every Sunday at 6:00 AM ET (11:00 UTC)
     - cron: '0 11 * * 0'
   workflow_dispatch:
+    inputs:
+      date:
+        description: 'Specific date to book (YYYY-MM-DD). Leave blank for auto-detect.'
+        required: false
+        default: ''
+      auto_complete:
+        description: 'Auto-complete purchase? (dangerous)'
+        type: boolean
+        required: false
+        default: false
 
 jobs:
   book:
@@ -33,11 +43,19 @@ jobs:
           TARGET_NUM_GOLFERS: ${{ vars.TARGET_NUM_GOLFERS || '1' }}
           AUTO_COMPLETE_PURCHASE: ${{ vars.AUTO_COMPLETE_PURCHASE || 'false' }}
           WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
-        run: python book_tee_time.py
+        run: |
+          ARGS=""
+          if [ -n "${{ github.event.inputs.date }}" ]; then
+            ARGS="$ARGS --date ${{ github.event.inputs.date }}"
+          fi
+          if [ "${{ github.event.inputs.auto_complete }}" == "true" ]; then
+            ARGS="$ARGS --auto-complete"
+          fi
+          python book_tee_time.py $ARGS
 
       - name: Upload screenshots
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: screenshots
+          name: screenshots-${{ github.run_id }}
           path: screenshots/
