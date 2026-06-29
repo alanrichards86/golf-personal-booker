@@ -10,6 +10,10 @@ on:
         description: 'Specific date to book (YYYY-MM-DD). Leave blank for auto-detect.'
         required: false
         default: ''
+      golfers:
+        description: 'Number of golfers (1-4). Leave blank to use default.'
+        required: false
+        default: ''
       auto_complete:
         description: 'Auto-complete purchase? (dangerous)'
         type: boolean
@@ -47,6 +51,9 @@ jobs:
           ARGS=""
           if [ -n "${{ github.event.inputs.date }}" ]; then
             ARGS="$ARGS --date ${{ github.event.inputs.date }}"
+          fi
+          if [ -n "${{ github.event.inputs.golfers }}" ]; then
+            ARGS="$ARGS --golfers ${{ github.event.inputs.golfers }}"
           fi
           if [ "${{ github.event.inputs.auto_complete }}" == "true" ]; then
             ARGS="$ARGS --auto-complete"

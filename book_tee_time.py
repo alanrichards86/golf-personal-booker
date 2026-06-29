@@ -7,6 +7,7 @@ Stops at "Complete your purchase" by default (human-in-the-loop safety).
 Usage:
     python book_tee_time.py
     python book_tee_time.py --date 2026-07-12
+    python book_tee_time.py --golfers 4
     python book_tee_time.py --auto-complete  # dangerous: clicks "Complete your purchase"
 """
 
@@ -16,7 +17,7 @@ import re
 import logging
 import argparse
 import datetime
-from typing import Optional, List
+from typing import Optional, List, Tuple
 from dotenv import load_dotenv
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
 
@@ -44,6 +45,41 @@ logging.basicConfig(
     handlers=[logging.StreamHandler(sys.stdout)],
 )
 logger = logging.getLogger("golf-booker")
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+def parse_player_availability(text: str) -> Tuple[int, int]:
+    """
+    Parse player availability text like '1', '1 - 4', '1 or 2', '1 - 3'.
+    Returns (min_players, max_players).
+    """
+    text = text.strip().lower()
+
+    # Pattern: "1 - 4" or "1-4"
+    m = re.search(r'(\d+)\s*-\s*(\d+)', text)
+    if m:
+        return int(m.group(1)), int(m.group(2))
+
+    # Pattern: "1 or 2"
+    m = re.search(r'(\d+)\s+or\s+(\d+)', text)
+    if m:
+        return int(m.group(1)), int(m.group(2))
+
+    # Pattern: single number like "1"
+    m = re.search(r'^(\d+)$', text)
+    if m:
+        n = int(m.group(1))
+        return n, n
+
+    return 0, 0
+
+
+def can_accommodate(text: str, num_golfers: int) -> bool:
+    """Check if a tee time availability text can accommodate num_golfers."""
+    min_p, max_p = parse_player_availability(text)
+    return min_p <= num_golfers <= max_p
 
 
 # ---------------------------------------------------------------------------
@@ -242,10 +278,14 @@ def navigate_to_date(iframe, target_date: datetime.date) -> None:
     logger.info("Date selected, tee times loading...")
 
 
-def select_tee_time(iframe) -> bool:
-    logger.info(f"Looking for tee times between {TARGET_HOUR_START}:00 and {TARGET_HOUR_END}:00...")
+def select_tee_time(iframe, num_golfers: int = TARGET_NUM_GOLFERS) -> bool:
+    logger.info(
+        f"Looking for tee times between {TARGET_HOUR_START}:00 and {TARGET_HOUR_END}:00 "
+        f"for {num_golfers} golfer(s)..."
+    )
     iframe.locator("[data-testid='teetimes_choose_rate_button']").first.wait_for(state="visible", timeout=15000)
 
+    # Each tee time is in a group/card. We need to inspect the text near each "Choose Rate" button.
     choose_buttons = iframe.locator("button:has-text('Choose Rate')").all()
     logger.info(f"Found {len(choose_buttons)} tee time option(s).")
 
@@ -254,6 +294,8 @@ def select_tee_time(iframe) -> bool:
 
     for btn in choose_buttons:
         aria = btn.get_attribute("aria-label") or ""
+
+        # Extract time from aria-label
         time_part = None
         if "," in aria:
             time_part = aria.split(",")[-1].strip().lower()
@@ -279,19 +321,62 @@ def select_tee_time(iframe) -> bool:
         if hour is None:
             continue
 
-        if TARGET_HOUR_START <= hour < TARGET_HOUR_END:
-            if hour < best_hour:
-                best_hour = hour
-                best_button = btn
+        if not (TARGET_HOUR_START <= hour < TARGET_HOUR_END):
+            continue
+
+        # Extract player availability from aria-label, e.g. "1 players available" or "1 - 4 players available"
+        player_text = ""
+        m = re.search(r'(\d+(?:\s*-\s*\d+|\s+or\s+\d+)?)\s+players?\s+available', aria.lower())
+        if m:
+            player_text = m.group(1)
+        else:
+            # Fallback: look at the sibling paragraph near the button
+            try:
+                card = btn.locator("xpath=ancestor::*[contains(@class, 'MuiGrid-item') or contains(@class, 'css-')][1]")
+                player_para = card.locator("p:has-text('players')").first
+                if player_para.is_visible(timeout=1000):
+                    player_text = player_para.inner_text(timeout=2000)
+            except Exception:
+                pass
+
+        if player_text and not can_accommodate(player_text, num_golfers):
+            logger.debug(f"Skipping {hour}:00 — only accommodates {player_text} players.")
+            continue
+
+        if hour < best_hour:
+            best_hour = hour
+            best_button = btn
 
     if best_button is None:
-        logger.warning("No tee times found in the preferred time window.")
+        logger.warning("No tee times found matching time window AND golfer count.")
         return False
 
     logger.info(f"Selecting tee time around {best_hour}:00...")
     best_button.click()
     iframe.page.wait_for_timeout(1500)
     return True
+
+
+def set_num_golfers(iframe, num_golfers: int) -> None:
+    """Select the correct number of golfers in the accordion radio group."""
+    logger.info(f"Setting number of golfers to {num_golfers}...")
+    try:
+        # The radio buttons have aria-label like "1 golfer", "2 golfers", etc.
+        radio = iframe.locator(f"[role='radio']:has-text('{num_golfers} golfer')").first
+        if not radio.is_visible(timeout=3000):
+            # Try plural form
+            radio = iframe.locator(f"[role='radio']:has-text('{num_golfers} golfers')").first
+
+        if radio.is_visible(timeout=3000):
+            if radio.is_enabled():
+                radio.click()
+                logger.info(f"Selected {num_golfers} golfer(s).")
+            else:
+                logger.warning(f"Radio for {num_golfers} golfers is disabled. Using default selection.")
+        else:
+            logger.warning(f"Could not find radio for {num_golfers} golfers. Using default selection.")
+    except Exception as e:
+        logger.warning(f"Failed to set golfer count: {e}. Using default.")
 
 
 def add_to_cart(iframe) -> None:
@@ -351,7 +436,11 @@ def take_screenshot(page, name: str) -> None:
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
-def run(target_date: Optional[datetime.date] = None, auto_complete: bool = False) -> None:
+def run(
+    target_date: Optional[datetime.date] = None,
+    auto_complete: bool = False,
+    num_golfers: int = TARGET_NUM_GOLFERS,
+) -> None:
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         context = browser.new_context(
@@ -385,17 +474,21 @@ def run(target_date: Optional[datetime.date] = None, auto_complete: bool = False
                 iframe = get_teeitup_frame(page)
 
             logger.info(f"Target date: {target_date} ({target_date.strftime('%A')})")
+            logger.info(f"Target golfers: {num_golfers}")
 
             navigate_to_date(iframe, target_date)
             take_screenshot(page, "04_after_date_select")
 
-            found = select_tee_time(iframe)
+            found = select_tee_time(iframe, num_golfers=num_golfers)
             if not found:
                 logger.error("No suitable tee time found. Exiting.")
                 take_screenshot(page, "05_no_tee_times")
                 sys.exit(1)
 
             take_screenshot(page, "05_after_tee_select")
+
+            set_num_golfers(iframe, num_golfers)
+            take_screenshot(page, "05b_after_golfer_select")
 
             add_to_cart(iframe)
             take_screenshot(page, "06_after_add_to_cart")
@@ -426,6 +519,12 @@ def main() -> None:
         help="Explicit date to book (YYYY-MM-DD). Overrides dynamic date logic.",
     )
     parser.add_argument(
+        "--golfers",
+        type=int,
+        default=TARGET_NUM_GOLFERS,
+        help=f"Number of golfers to book for (default: {TARGET_NUM_GOLFERS})",
+    )
+    parser.add_argument(
         "--auto-complete",
         action="store_true",
         help="Click 'Complete your purchase' automatically (DANGEROUS).",
@@ -446,6 +545,10 @@ def main() -> None:
             logger.error(f"Invalid date format: {args.date}. Use YYYY-MM-DD.")
             sys.exit(1)
 
+    if args.golfers < 1 or args.golfers > 4:
+        logger.error("Number of golfers must be between 1 and 4.")
+        sys.exit(1)
+
     auto_complete = args.auto_complete or AUTO_COMPLETE_PURCHASE
     if auto_complete:
         logger.warning("=" * 60)
@@ -453,7 +556,7 @@ def main() -> None:
         logger.warning("This will finalize the purchase without human review.")
         logger.warning("=" * 60)
 
-    run(target_date=explicit_date, auto_complete=auto_complete)
+    run(target_date=explicit_date, auto_complete=auto_complete, num_golfers=args.golfers)
 
 
 if __name__ == "__main__":
