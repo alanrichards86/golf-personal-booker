@@ -224,8 +224,10 @@ def enter_wordpress_password(page) -> None:
         if password_input.is_visible(timeout=3000):
             logger.info("Entering WordPress password...")
             password_input.fill(FOREPASS_PASSWORD)
-            page.locator("button:has-text('Enter'), input[type='submit']").first.click()
-            page.wait_for_load_state("networkidle")
+            submit_btn = page.locator("button:has-text('Enter'), input[type='submit']").first
+            submit_btn.click()
+            logger.info("Waiting for page to load after password entry...")
+            page.wait_for_load_state("networkidle", timeout=30000)
             logger.info("WordPress password submitted.")
         else:
             logger.info("No WordPress password prompt.")
@@ -233,7 +235,8 @@ def enter_wordpress_password(page) -> None:
         logger.info("No WordPress password prompt detected.")
 
 
-def login_teeitup(iframe) -> None:
+def login_teeitup(iframe, page) -> None:
+    """Log into TeeItUp inside the iframe with retry and error detection."""
     logger.info("Checking TeeItUp login state...")
     try:
         user_menu = iframe.locator("[data-testid='core-user-menu']").first
@@ -245,12 +248,56 @@ def login_teeitup(iframe) -> None:
 
     logger.info("Opening TeeItUp login form...")
     iframe.locator("[data-testid='core-login-signup']").first.click()
+    iframe.page.wait_for_timeout(1000)
+
     logger.info("Filling TeeItUp credentials...")
     iframe.locator("[data-testid='login-email-component']").fill(TEEITUP_USERNAME)
     iframe.locator("[data-testid='login-password-component']").fill(TEEITUP_PASSWORD)
+
+    logger.info("Clicking login button...")
     iframe.locator("[data-testid='login-button']").click()
-    iframe.locator("[data-testid='core-user-menu']").first.wait_for(state="visible", timeout=15000)
-    logger.info("TeeItUp login successful.")
+
+    # Wait for either login success or error message
+    logger.info("Waiting for login response...")
+    iframe.page.wait_for_timeout(3000)
+
+    # Check for error messages
+    error_selectors = [
+        "text=Invalid",
+        "text=incorrect",
+        "text=password",
+        "text=error",
+        "[role='alert']",
+        ".MuiAlert-root",
+        "text=try again",
+    ]
+    for sel in error_selectors:
+        try:
+            error_elem = iframe.locator(sel).first
+            if error_elem.is_visible(timeout=1000):
+                error_text = error_elem.inner_text(timeout=2000)
+                logger.error(f"Login error detected: {error_text}")
+                raise RuntimeError(f"TeeItUp login failed: {error_text}")
+        except Exception:
+            continue
+
+    # Take screenshot to debug login state
+    take_screenshot(page, "03b_after_login_click")
+
+    # Try waiting for user menu with longer timeout
+    try:
+        iframe.locator("[data-testid='core-user-menu']").first.wait_for(state="visible", timeout=20000)
+        logger.info("TeeItUp login successful.")
+    except PlaywrightTimeout:
+        # One more retry: sometimes the page refreshes and iframe changes
+        logger.warning("First login attempt timed out. Retrying iframe detection...")
+        iframe = get_teeitup_frame(page)
+        try:
+            iframe.locator("[data-testid='core-user-menu']").first.wait_for(state="visible", timeout=10000)
+            logger.info("TeeItUp login successful on retry.")
+        except PlaywrightTimeout:
+            take_screenshot(page, "03c_login_failed")
+            raise RuntimeError("TeeItUp login timed out. Check credentials or if 2FA is required.")
 
 
 def get_calendar_month_text(iframe) -> str:
@@ -535,7 +582,7 @@ def run(
             take_screenshot(page, "02_after_wp_password")
 
             iframe = get_teeitup_frame(page)
-            login_teeitup(iframe)
+            login_teeitup(iframe, page)
             take_screenshot(page, "03_after_login")
 
             # If no explicit date provided, check reservations and determine dynamically
