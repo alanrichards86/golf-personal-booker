@@ -1,0 +1,43 @@
+name: Book Browns Mill Tee Time
+
+on:
+  schedule:
+    # Every Sunday at 6:00 AM ET (11:00 UTC)
+    - cron: '0 11 * * 0'
+  workflow_dispatch:
+
+jobs:
+  book:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          playwright install chromium
+
+      - name: Run booking script
+        env:
+          FOREPASS_PASSWORD: ${{ secrets.FOREPASS_PASSWORD }}
+          TEEITUP_USERNAME: ${{ secrets.TEEITUP_USERNAME }}
+          TEEITUP_PASSWORD: ${{ secrets.TEEITUP_PASSWORD }}
+          TARGET_DAY_OF_WEEK: ${{ vars.TARGET_DAY_OF_WEEK || '6' }}
+          TARGET_HOUR_START: ${{ vars.TARGET_HOUR_START || '7' }}
+          TARGET_HOUR_END: ${{ vars.TARGET_HOUR_END || '12' }}
+          TARGET_NUM_GOLFERS: ${{ vars.TARGET_NUM_GOLFERS || '1' }}
+          AUTO_COMPLETE_PURCHASE: ${{ vars.AUTO_COMPLETE_PURCHASE || 'false' }}
+          WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
+        run: python book_tee_time.py
+
+      - name: Upload screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: screenshots
+          path: screenshots/
