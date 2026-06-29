@@ -2,8 +2,9 @@ name: Book Browns Mill Tee Time
 
 on:
   schedule:
-    # Every Sunday at 1:00 AM ET (5:00 UTC during EDT / 6:00 UTC during EST)
-    - cron: '0 5 * * 0'
+    # TEMPORARY TEST RUN — will trigger around 02:08 UTC
+    # TODO: Revert to '0 5 * * 0' after testing
+    - cron: '8 2 * * *'
   workflow_dispatch:
     inputs:
       date:
