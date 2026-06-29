@@ -253,28 +253,101 @@ def login_teeitup(iframe) -> None:
     logger.info("TeeItUp login successful.")
 
 
+def get_calendar_month_text(iframe) -> str:
+    """Read the current month/year label from the calendar header."""
+    try:
+        # The month label is typically the only paragraph directly inside the calendar header row
+        month_label = iframe.locator(
+            "[data-testid='teetimes-calendar-component'] >> div >> button >> .. >> p"
+        ).first
+        # Fallback: try any paragraph that looks like a month/year
+        if not month_label.is_visible(timeout=1000):
+            month_label = iframe.locator(
+                "[data-testid='teetimes-calendar-component'] p"
+            ).filter(has_text=re.compile(r"(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{4}"))
+        return month_label.inner_text(timeout=3000).strip()
+    except Exception:
+        return ""
+
+
 def navigate_to_date(iframe, target_date: datetime.date) -> None:
+    """
+    Navigate the TeeItUp calendar to the target date.
+    Robustly handles month boundaries and React re-renders.
+    """
     logger.info(f"Navigating calendar to {target_date}...")
     target_month_year = target_date.strftime("%B %Y")
-
-    for _ in range(12):
-        month_label = iframe.locator("[data-testid='teetimes-calendar-component'] p").first
-        current_text = month_label.inner_text(timeout=5000).strip()
-        if target_month_year.lower() in current_text.lower():
-            break
-        next_month_btn = iframe.locator("button[aria-label*='Next month'], button:has-text('Next month')").first
-        next_month_btn.click()
-        iframe.page.wait_for_timeout(500)
-    else:
-        raise RuntimeError(f"Could not navigate to {target_month_year}")
-
     day_str = str(target_date.day)
-    logger.info(f"Selecting day {day_str}...")
-    date_cell = iframe.locator(f"[role='gridcell']:has-text('{day_str}')").first
-    if date_cell.get_attribute("disabled"):
-        raise RuntimeError(f"Date {target_date} is disabled/unavailable.")
-    date_cell.click()
-    iframe.page.wait_for_timeout(2000)
+
+    # Step 1: Advance months until we see the target month/year
+    for attempt in range(12):
+        current_text = get_calendar_month_text(iframe)
+        logger.info(f"Calendar currently showing: {current_text}")
+
+        if target_month_year.lower() in current_text.lower():
+            logger.info(f"Reached target month: {target_month_year}")
+            break
+
+        # Click Next month and wait for React to re-render
+        logger.info("Clicking Next month...")
+        next_month_btn = iframe.locator(
+            "button[aria-label*='Next month'], button:has-text('Next month')"
+        ).first
+        next_month_btn.click()
+
+        # Wait for the month text to actually change (poll for up to 5 seconds)
+        for _ in range(50):
+            iframe.page.wait_for_timeout(100)
+            new_text = get_calendar_month_text(iframe)
+            if new_text and new_text != current_text:
+                logger.info(f"Month changed to: {new_text}")
+                break
+        else:
+            logger.warning("Month text did not change after clicking Next month.")
+    else:
+        raise RuntimeError(f"Could not navigate to {target_month_year} after 12 attempts")
+
+    # Step 2: Find the correct date cell in the CURRENT month's rowgroup
+    logger.info(f"Looking for day {day_str} in {target_month_year}...")
+
+    # The calendar has a rowgroup containing the current month's dates.
+    # We want to avoid clicking a date from the previous/next month's padding.
+    # Strategy: find all visible gridcells with the target day, then pick the
+    # one that is NOT disabled and is inside the main rowgroup.
+    all_cells = iframe.locator(f"[role='gridcell']:has-text('{day_str}')").all()
+    logger.info(f"Found {len(all_cells)} cell(s) with text '{day_str}'")
+
+    target_cell = None
+    for cell in all_cells:
+        try:
+            is_disabled = cell.get_attribute("disabled") or cell.get_attribute("aria-disabled") == "true"
+            if is_disabled:
+                logger.debug(f"Skipping disabled cell for day {day_str}")
+                continue
+
+            # Additional check: make sure the cell is actually clickable
+            if not cell.is_enabled(timeout=500):
+                continue
+
+            target_cell = cell
+            break
+        except Exception:
+            continue
+
+    if target_cell is None:
+        # If the target date itself is disabled, try the NEXT occurrence
+        # of the same weekday in the following week
+        next_date = target_date + datetime.timedelta(days=7)
+        logger.warning(
+            f"Date {target_date} is unavailable. "
+            f"Trying next occurrence: {next_date}..."
+        )
+        navigate_to_date(iframe, next_date)
+        return
+
+    logger.info(f"Clicking day {day_str}...")
+    target_cell.click()
+    iframe.page.wait_for_timeout(2500)
     logger.info("Date selected, tee times loading...")
 
 
@@ -535,7 +608,16 @@ def main() -> None:
         default=TARGET_DAY_OF_WEEK,
         help="Day of week to target: 0=Mon, 6=Sun (default: 6)",
     )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Enable verbose debug logging.",
+    )
     args = parser.parse_args()
+
+    if args.debug:
+        logging.getLogger().setLevel(logging.DEBUG)
+        logger.setLevel(logging.DEBUG)
 
     explicit_date = None
     if args.date:
